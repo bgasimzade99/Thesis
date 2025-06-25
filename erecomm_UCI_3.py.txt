@@ -1,0 +1,784 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+from mlxtend.frequent_patterns import apriori, association_rules
+from mlxtend.preprocessing import TransactionEncoder
+import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+import time
+import pickle
+import os
+from datetime import datetime
+import warnings
+
+from erecomm_UCI_2 import *
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+random.seed(42)
+
+class RGRModelTrainer:
+    """
+    Enhanced RGR Model with explicit training procedures and model persistence
+    """
+    
+    def __init__(self, 
+                 # Association Rules parameters
+                 min_support=0.02, 
+                 min_confidence=0.3,
+                 # Q-Learning parameters
+                 learning_rate=0.1, 
+                 discount_factor=0.9, 
+                 exploration_rate=0.1,
+                 # Training parameters
+                 q_learning_epochs=100,
+                 batch_size=32):
+        
+        self.min_support = min_support
+        self.min_confidence = min_confidence
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.exploration_rate = exploration_rate
+        self.q_learning_epochs = q_learning_epochs
+        self.batch_size = batch_size
+        
+        # Model components
+        self.association_rules_df = None
+        self.graph = None
+        self.q_table = defaultdict(lambda: defaultdict(float))
+        self.user_item_matrix = None
+        self.item_stats = None
+        self.customer_stats = None
+        
+        # Training history
+        self.training_history = {
+            'association_rules': {},
+            'q_learning': {
+                'epoch_rewards': [],
+                'epoch_losses': [],
+                'exploration_rates': [],
+                'convergence_metrics': []
+            }
+        }
+    
+    def train_association_rules_detailed(self, transactions):
+        """
+        TRAINING COMPONENT 1: Association Rule Mining with detailed tracking
+        This is where actual training happens for association rules
+        """
+        print("🔍 TRAINING: Association Rule Mining")
+        print("=" * 50)
+        
+        start_time = time.time()
+        
+        # Convert transactions to binary matrix
+        te = TransactionEncoder()
+        te_ary = te.fit(transactions).transform(transactions)
+        df_encoded = pd.DataFrame(te_ary, columns=te.columns_)
+        
+        print(f"   Transaction matrix: {df_encoded.shape}")
+        print(f"   Unique items: {len(te.columns_)}")
+        print(f"   Training parameters:")
+        print(f"     - min_support: {self.min_support}")
+        print(f"     - min_confidence: {self.min_confidence}")
+        
+        # Find frequent itemsets (CORE TRAINING STEP)
+        try:
+            frequent_itemsets = apriori(df_encoded, 
+                                      min_support=self.min_support, 
+                                      use_colnames=True, 
+                                      verbose=1)  # Show progress
+            print(f"   ✅ Found {len(frequent_itemsets)} frequent itemsets")
+        except:
+            print(f"   ⚠️ No itemsets with support {self.min_support}, trying {self.min_support/2}")
+            self.min_support = self.min_support / 2
+            frequent_itemsets = apriori(df_encoded, 
+                                      min_support=self.min_support, 
+                                      use_colnames=True)
+            print(f"   ✅ Found {len(frequent_itemsets)} frequent itemsets with lower support")
+        
+        # Generate association rules (CORE TRAINING STEP)
+        if len(frequent_itemsets) > 0:
+            self.association_rules_df = association_rules(
+                frequent_itemsets, 
+                metric="confidence", 
+                min_threshold=self.min_confidence
+            )
+            
+            training_time = time.time() - start_time
+            
+            # Store training statistics
+            self.training_history['association_rules'] = {
+                'training_time': training_time,
+                'num_transactions': len(transactions),
+                'num_items': len(te.columns_),
+                'num_frequent_itemsets': len(frequent_itemsets),
+                'num_rules': len(self.association_rules_df),
+                'avg_confidence': self.association_rules_df['confidence'].mean() if len(self.association_rules_df) > 0 else 0,
+                'max_confidence': self.association_rules_df['confidence'].max() if len(self.association_rules_df) > 0 else 0,
+                'final_min_support': self.min_support
+            }
+            
+            print(f"   ✅ Generated {len(self.association_rules_df)} association rules")
+            print(f"   📊 Training completed in {training_time:.2f} seconds")
+            print(f"   📈 Average confidence: {self.training_history['association_rules']['avg_confidence']:.3f}")
+            
+        else:
+            self.association_rules_df = pd.DataFrame()
+            print("   ❌ No association rules generated")
+        
+        return self.association_rules_df
+    
+    def train_q_learning_explicit(self, user_item_matrix, simulation_users=50):
+        """
+        TRAINING COMPONENT 3: Explicit Q-Learning Training with Multiple Epochs
+        This is where actual iterative training happens for Q-Learning
+        """
+        print("\n🎯 TRAINING: Q-Learning with Multiple Epochs")
+        print("=" * 50)
+        
+        print(f"   Training parameters:")
+        print(f"     - epochs: {self.q_learning_epochs}")
+        print(f"     - learning_rate: {self.learning_rate}")
+        print(f"     - discount_factor: {self.discount_factor}")
+        print(f"     - exploration_rate: {self.exploration_rate}")
+        print(f"     - batch_size: {self.batch_size}")
+        
+        # Initialize Q-table
+        for user in user_item_matrix.index:
+            for item in user_item_matrix.columns:
+                self.q_table[user][item] = np.random.uniform(0, 0.1)
+        
+        # Select training users
+        training_users = list(user_item_matrix.index)[:simulation_users]
+        print(f"   Training on {len(training_users)} users")
+        
+        # CORE TRAINING LOOP - MULTIPLE EPOCHS
+        for epoch in range(self.q_learning_epochs):
+            epoch_rewards = []
+            epoch_losses = []
+            
+            # Batch training
+            for batch_start in range(0, len(training_users), self.batch_size):
+                batch_end = min(batch_start + self.batch_size, len(training_users))
+                batch_users = training_users[batch_start:batch_end]
+                
+                batch_rewards = []
+                batch_losses = []
+                
+                for user_id in batch_users:
+                    user_row = user_item_matrix.loc[user_id]
+                    user_items = user_row[user_row > 0].index.tolist()
+                    
+                    if len(user_items) < 2:
+                        continue
+                    
+                    # Simulate recommendation and feedback
+                    available_items = [item for item in user_item_matrix.columns 
+                                     if item not in user_items]
+                    
+                    if len(available_items) == 0:
+                        continue
+                    
+                    # Epsilon-greedy action selection
+                    if np.random.random() < self.exploration_rate:
+                        # Exploration
+                        selected_item = random.choice(available_items)
+                    else:
+                        # Exploitation - choose item with highest Q-value
+                        q_values = {item: self.q_table[user_id][item] for item in available_items}
+                        selected_item = max(q_values, key=q_values.get)
+                    
+                    # Simulate reward (in real system, this would be actual user feedback)
+                    reward = self.simulate_advanced_feedback(user_id, selected_item, user_item_matrix)
+                    
+                    # Q-Learning Update (CORE LEARNING STEP)
+                    old_q = self.q_table[user_id][selected_item]
+                    max_next_q = max(self.q_table[user_id].values()) if self.q_table[user_id] else 0
+                    new_q = old_q + self.learning_rate * (reward + self.discount_factor * max_next_q - old_q)
+                    self.q_table[user_id][selected_item] = new_q
+                    
+                    # Track metrics
+                    batch_rewards.append(reward)
+                    batch_losses.append(abs(new_q - old_q))
+                
+                if batch_rewards:
+                    epoch_rewards.extend(batch_rewards)
+                    epoch_losses.extend(batch_losses)
+            
+            # Calculate epoch metrics
+            avg_reward = np.mean(epoch_rewards) if epoch_rewards else 0
+            avg_loss = np.mean(epoch_losses) if epoch_losses else 0
+            
+            self.training_history['q_learning']['epoch_rewards'].append(avg_reward)
+            self.training_history['q_learning']['epoch_losses'].append(avg_loss)
+            self.training_history['q_learning']['exploration_rates'].append(self.exploration_rate)
+            
+            # Decay exploration rate
+            self.exploration_rate = max(0.01, self.exploration_rate * 0.995)
+            
+            # Print progress
+            if (epoch + 1) % 20 == 0:
+                print(f"   Epoch {epoch + 1:3d}/{self.q_learning_epochs}: "
+                      f"Avg Reward: {avg_reward:.3f}, "
+                      f"Avg Loss: {avg_loss:.3f}, "
+                      f"Exploration: {self.exploration_rate:.3f}")
+        
+        print(f"   ✅ Q-Learning training completed!")
+        print(f"   📊 Final exploration rate: {self.exploration_rate:.3f}")
+        
+        return self.q_table
+    
+    def simulate_advanced_feedback(self, user_id, recommended_item, user_item_matrix):
+        """
+        Advanced feedback simulation with multiple factors
+        """
+        # Base reward
+        reward = 0.0
+        
+        if user_id in user_item_matrix.index:
+            user_row = user_item_matrix.loc[user_id]
+            user_items = user_row[user_row > 0].index.tolist()
+            
+            # Factor 1: Item popularity
+            item_popularity = user_item_matrix[recommended_item].sum() / len(user_item_matrix)
+            
+            # Factor 2: User activity level
+            user_activity = len(user_items) / len(user_item_matrix.columns)
+            
+            # Factor 3: Random factor
+            random_factor = np.random.normal(0, 0.2)
+            
+            # Combine factors
+            reward = 0.3 * item_popularity + 0.3 * user_activity + 0.4 * random_factor
+            
+            # Add bonus for diversity
+            if recommended_item not in user_items:
+                reward += 0.1
+        
+        # Normalize to [-1, 1] range
+        return np.clip(reward, -1, 1)
+    
+    def save_model(self, filepath="rgr_model.pkl"):
+        """
+        Save the complete trained RGR model
+        """
+        print(f"💾 Saving RGR model to {filepath}")
+        
+        model_data = {
+            'association_rules_df': self.association_rules_df,
+            'graph': self.graph,
+            'q_table': dict(self.q_table),  # Convert defaultdict to regular dict
+            'user_item_matrix': self.user_item_matrix,
+            'item_stats': self.item_stats,
+            'customer_stats': self.customer_stats,
+            'training_history': self.training_history,
+            'model_parameters': {
+                'min_support': self.min_support,
+                'min_confidence': self.min_confidence,
+                'learning_rate': self.learning_rate,
+                'discount_factor': self.discount_factor,
+                'exploration_rate': self.exploration_rate,
+                'q_learning_epochs': self.q_learning_epochs,
+                'batch_size': self.batch_size
+            },
+            'training_timestamp': datetime.now().isoformat()
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        print(f"   ✅ Model saved successfully!")
+        print(f"   📊 Model components saved:")
+        print(f"     - Association rules: {len(self.association_rules_df) if self.association_rules_df is not None else 0}")
+        print(f"     - Graph nodes: {self.graph.number_of_nodes() if self.graph else 0}")
+        print(f"     - Q-table entries: {len(self.q_table)}")
+        print(f"     - Training history: {len(self.training_history)} components")
+    
+    @staticmethod
+    def load_model(filepath="rgr_model.pkl"):
+        """
+        Load a saved RGR model
+        """
+        print(f"📥 Loading RGR model from {filepath}")
+        
+        try:
+            with open(filepath, 'rb') as f:
+                model_data = pickle.load(f)
+            
+            # Create new instance
+            trainer = RGRModelTrainer()
+            
+            # Restore model components
+            trainer.association_rules_df = model_data['association_rules_df']
+            trainer.graph = model_data['graph']
+            trainer.q_table = defaultdict(lambda: defaultdict(float), model_data['q_table'])
+            trainer.user_item_matrix = model_data['user_item_matrix']
+            trainer.item_stats = model_data['item_stats']
+            trainer.customer_stats = model_data['customer_stats']
+            trainer.training_history = model_data['training_history']
+            
+            # Restore parameters
+            params = model_data['model_parameters']
+            trainer.min_support = params['min_support']
+            trainer.min_confidence = params['min_confidence']
+            trainer.learning_rate = params['learning_rate']
+            trainer.discount_factor = params['discount_factor']
+            trainer.exploration_rate = params['exploration_rate']
+            trainer.q_learning_epochs = params['q_learning_epochs']
+            trainer.batch_size = params['batch_size']
+            
+            print(f"   ✅ Model loaded successfully!")
+            print(f"   📅 Training date: {model_data['training_timestamp']}")
+            print(f"   📊 Model components loaded:")
+            print(f"     - Association rules: {len(trainer.association_rules_df) if trainer.association_rules_df is not None else 0}")
+            print(f"     - Graph nodes: {trainer.graph.number_of_nodes() if trainer.graph else 0}")
+            print(f"     - Q-table entries: {len(trainer.q_table)}")
+            
+            return trainer
+            
+        except FileNotFoundError:
+            print(f"   ❌ Model file not found: {filepath}")
+            return None
+        except Exception as e:
+            print(f"   ❌ Error loading model: {e}")
+            return None
+    
+    def plot_advanced_results(self):
+        """
+        Plot comprehensive training and performance results
+        """
+        
+        # 1. Q-Learning Training Curves
+        plt.figure(figsize=(10, 6))
+        if self.training_history['q_learning']['epoch_rewards']:
+            epochs = range(1, len(self.training_history['q_learning']['epoch_rewards']) + 1)
+            plt.plot(epochs, self.training_history['q_learning']['epoch_rewards'], 'b-', label='Rewards', linewidth=2)
+            plt.title('Q-Learning Training Rewards')
+            plt.xlabel('Epoch')
+            plt.ylabel('Average Reward')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+        plt.tight_layout()
+        # plt.show()
+        
+        # 2. Q-Learning Loss Curves
+        plt.figure(figsize=(10, 6))
+        if self.training_history['q_learning']['epoch_losses']:
+            epochs = range(1, len(self.training_history['q_learning']['epoch_losses']) + 1)
+            plt.plot(epochs, self.training_history['q_learning']['epoch_losses'], 'r-', label='Losses', linewidth=2)
+            plt.title('Q-Learning Training Losses')
+            plt.xlabel('Epoch')
+            plt.ylabel('Average Loss')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+        plt.tight_layout()
+        # plt.show()
+        
+        # 3. Exploration Rate Decay
+        plt.figure(figsize=(10, 6))
+        if self.training_history['q_learning']['exploration_rates']:
+            epochs = range(1, len(self.training_history['q_learning']['exploration_rates']) + 1)
+            plt.plot(epochs, self.training_history['q_learning']['exploration_rates'], 'g-', label='Exploration Rate', linewidth=2)
+            plt.title('Exploration Rate Decay')
+            plt.xlabel('Epoch')
+            plt.ylabel('Exploration Rate')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+        plt.tight_layout()
+        # plt.show()
+        
+        # 4. Association Rules Analysis
+        plt.figure(figsize=(10, 8))
+        if self.association_rules_df is not None and len(self.association_rules_df) > 0:
+            scatter = plt.scatter(self.association_rules_df['support'], self.association_rules_df['confidence'], 
+                    c=self.association_rules_df['lift'], cmap='viridis', alpha=0.6)
+            plt.title('Association Rules: Support vs Confidence')
+            plt.xlabel('Support')
+            plt.ylabel('Confidence')
+            plt.grid(True, alpha=0.3)
+            cbar = plt.colorbar(scatter)
+            cbar.set_label('Lift')
+        plt.tight_layout()
+        # plt.show()
+        
+        # 5. User-Item Matrix Heatmap (sample)
+        plt.figure(figsize=(12, 10))
+        if self.user_item_matrix is not None:
+            # Sample for visualization
+            sample_matrix = self.user_item_matrix.iloc[:20, :20]
+            sns.heatmap(sample_matrix, cmap='Blues', cbar=True)
+            plt.title('User-Item Interactions (Sample)')
+            plt.xlabel('Items')
+            plt.ylabel('Users')
+        plt.tight_layout()
+        # plt.show()
+        
+        # 6. Item Popularity Distribution
+        plt.figure(figsize=(10, 6))
+        if self.item_stats is not None:
+            plt.hist(self.item_stats['unique_customers'], bins=30, alpha=0.7, color='skyblue', edgecolor='black')
+            plt.title('Item Popularity Distribution')
+            plt.xlabel('Number of Unique Customers')
+            plt.ylabel('Number of Items')
+            plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        # plt.show()
+        
+        # 7. Customer Activity Distribution
+        plt.figure(figsize=(10, 6))
+        if self.customer_stats is not None:
+            plt.hist(self.customer_stats['unique_products'], bins=30, alpha=0.7, color='lightgreen', edgecolor='black')
+            plt.title('Customer Activity Distribution')
+            plt.xlabel('Number of Unique Products Purchased')
+            plt.ylabel('Number of Customers')
+            plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        # plt.show()
+        
+        # 8. Q-Values Distribution
+        plt.figure(figsize=(10, 6))
+        if self.q_table:
+            all_q_values = []
+            for user_dict in self.q_table.values():
+                all_q_values.extend(user_dict.values())
+            plt.hist(all_q_values, bins=50, alpha=0.7, color='orange', edgecolor='black')
+            plt.title('Q-Values Distribution')
+            plt.xlabel('Q-Value')
+            plt.ylabel('Frequency')
+            plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        # plt.show()
+        
+        # 9. Training Summary
+        plt.figure(figsize=(10, 8))
+        plt.axis('off')
+        summary_text = f"""
+        TRAINING SUMMARY
+        ================
+        
+        Association Rules:
+        • Rules generated: {len(self.association_rules_df) if self.association_rules_df is not None else 0}
+        • Min support: {self.min_support:.3f}
+        • Min confidence: {self.min_confidence:.3f}
+        
+        Q-Learning:
+        • Epochs trained: {self.q_learning_epochs}
+        • Learning rate: {self.learning_rate}
+        • Final exploration: {self.exploration_rate:.3f}
+        
+        Graph:
+        • Nodes: {self.graph.number_of_nodes() if self.graph else 0}
+        • Edges: {self.graph.number_of_edges() if self.graph else 0}
+        
+        Data:
+        • Users: {self.user_item_matrix.shape[0] if self.user_item_matrix is not None else 0}
+        • Items: {self.user_item_matrix.shape[1] if self.user_item_matrix is not None else 0}
+        """
+        plt.text(0.1, 0.9, summary_text, fontsize=10, verticalalignment='top', 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.5))
+        plt.tight_layout()
+        plt.show()  
+
+    def test_recommendations(self, test_user_ids, top_k=5):
+        """
+        Test the trained model on specific users
+        """
+        print(f"🧪 TESTING: Generating recommendations for {len(test_user_ids)} users")
+        print("=" * 60)
+        
+        results = []
+        
+        for i, user_id in enumerate(test_user_ids, 1):
+            if user_id not in self.user_item_matrix.index:
+                print(f"   ⚠️ User {user_id} not found in training data")
+                continue
+            
+            print(f"\n👤 Test User {i} (ID: {user_id}):")
+            
+            # Get user's purchase history
+            user_row = self.user_item_matrix.loc[user_id]
+            user_items = user_row[user_row > 0].index.tolist()
+            print(f"   📋 Purchase history: {len(user_items)} items")
+            
+            # Show sample items
+            for item in user_items[:3]:
+                print(f"     • {item}")
+            if len(user_items) > 3:
+                print(f"     ... and {len(user_items) - 3} more items")
+            
+            # Generate recommendations
+            start_time = time.time()
+            recommendations = self.get_hybrid_recommendations(user_id, top_k=top_k)
+            rec_time = time.time() - start_time
+            
+            print(f"   🎯 Top {top_k} Recommendations (Generated in {rec_time:.4f}s):")
+            
+            if recommendations:
+                for j, rec in enumerate(recommendations, 1):
+                    print(f"     {j}. {rec['item'][:50]}... (Score: {rec['score']:.3f})")
+                
+                results.append({
+                    'user_id': user_id,
+                    'num_history_items': len(user_items),
+                    'num_recommendations': len(recommendations),
+                    'recommendation_time': rec_time,
+                    'recommendations': recommendations
+                })
+            else:
+                print("     ❌ No recommendations generated")
+        
+        return results
+    
+    def get_hybrid_recommendations(self, user_id, top_k=10):
+        """
+        Generate hybrid recommendations using all three RGR components
+        """
+        # Get user's interaction history
+        if user_id not in self.user_item_matrix.index:
+            return []
+        
+        user_row = self.user_item_matrix.loc[user_id]
+        user_items = user_row[user_row > 0].index.tolist()
+        
+        if len(user_items) == 0:
+            return []
+        
+        # Get recommendations from each component
+        assoc_recs = self.get_association_recommendations(user_items, top_k)
+        graph_recs = self.get_graph_recommendations(user_id, top_k)
+        rl_recs = self.get_rl_recommendations(user_id, user_items, top_k)
+        
+        # Combine recommendations with weights
+        all_recommendations = {}
+        weights = {
+            'association_rules': 0.4,
+            'graph_based': 0.4,
+            'rl_exploitation': 0.15,
+            'rl_exploration': 0.05
+        }
+        
+        # Process all recommendation types
+        for rec_list, method_key in [(assoc_recs, 'association_rules'), 
+                                    (graph_recs, 'graph_based')]:
+            for rec in rec_list:
+                item = rec['item']
+                score = rec['score'] * weights[method_key]
+                all_recommendations[item] = all_recommendations.get(item, 0) + score
+        
+        for rec in rl_recs:
+            item = rec['item']
+            weight = weights.get(rec['method'], 0.1)
+            normalized_score = (rec['score'] + 1) / 2
+            score = normalized_score * weight
+            all_recommendations[item] = all_recommendations.get(item, 0) + score
+        
+        # Sort by combined score
+        final_recs = sorted(all_recommendations.items(), key=lambda x: x[1], reverse=True)
+        
+        return [{'item': item, 'score': score} for item, score in final_recs[:top_k]]
+    
+    def get_association_recommendations(self, user_items, top_k=5):
+        """Get recommendations using association rules"""
+        recommendations = []
+        
+        if self.association_rules_df is None or len(self.association_rules_df) == 0:
+            return recommendations
+        
+        for item in user_items:
+            relevant_rules = self.association_rules_df[
+                self.association_rules_df['antecedents'].apply(lambda x: item in x)
+            ]
+            
+            for _, rule in relevant_rules.iterrows():
+                for consequent in rule['consequents']:
+                    if consequent not in user_items:
+                        recommendations.append({
+                            'item': consequent,
+                            'score': rule['confidence'],
+                            'method': 'association_rules'
+                        })
+        
+        # Remove duplicates and sort
+        unique_recommendations = {}
+        for rec in recommendations:
+            if rec['item'] not in unique_recommendations:
+                unique_recommendations[rec['item']] = rec
+            elif rec['score'] > unique_recommendations[rec['item']]['score']:
+                unique_recommendations[rec['item']] = rec
+        
+        final_recommendations = list(unique_recommendations.values())
+        final_recommendations.sort(key=lambda x: x['score'], reverse=True)
+        
+        return final_recommendations[:top_k]
+    
+    def get_graph_recommendations(self, user_id, top_k=5):
+        """Get recommendations using graph-based collaborative filtering"""
+        user_node = f"user_{user_id}"
+        recommendations = []
+        
+        if self.graph is None or user_node not in self.graph:
+            return recommendations
+        
+        user_items = list(self.graph.neighbors(user_node))
+        item_scores = defaultdict(float)
+        
+        for item_node in user_items:
+            similar_users = [n for n in self.graph.neighbors(item_node) 
+                           if n.startswith('user_') and n != user_node]
+            
+            for similar_user in similar_users:
+                recommended_items = [n for n in self.graph.neighbors(similar_user) 
+                                   if n.startswith('item_') and n not in user_items]
+                
+                for rec_item in recommended_items:
+                    item_name = rec_item.replace('item_', '')
+                    item_scores[item_name] += 1.0
+        
+        # Normalize scores
+        for item in item_scores:
+            item_scores[item] = item_scores[item] / len(user_items) if len(user_items) > 0 else 0
+        
+        # Convert to recommendation format
+        for item, score in sorted(item_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]:
+            recommendations.append({
+                'item': item,
+                'score': score,
+                'method': 'graph_based'
+            })
+        
+        return recommendations
+    
+    def get_rl_recommendations(self, user_id, user_items, top_k=5):
+        """Get recommendations using Q-learning"""
+        if user_id not in self.q_table:
+            return []
+        
+        user_q_values = self.q_table[user_id]
+        available_items = {item: q_val for item, q_val in user_q_values.items() 
+                          if item not in user_items}
+        
+        recommendations = []
+        
+        # Epsilon-greedy strategy
+        if np.random.random() < self.exploration_rate:
+            # Exploration: random items
+            if len(available_items) > 0:
+                item_list = list(available_items.keys())
+                random_items = random.sample(item_list, min(top_k, len(item_list)))
+                for item in random_items:
+                    recommendations.append({
+                        'item': item,
+                        'score': available_items[item],
+                        'method': 'rl_exploration'
+                    })
+        else:
+            # Exploitation: best Q-values
+            sorted_items = sorted(available_items.items(), key=lambda x: x[1], reverse=True)
+            for item, q_val in sorted_items[:top_k]:
+                recommendations.append({
+                    'item': item,
+                    'score': q_val,
+                    'method': 'rl_exploitation'
+                })
+        
+        return recommendations
+
+# Usage example for complete training and testing workflow
+def complete_training_and_testing_workflow():
+    """
+    Complete workflow: Train model, save it, load it, and test
+    """
+    print("🚀 COMPLETE RGR TRAINING & TESTING WORKFLOW")
+    print("=" * 70)
+    
+    # This would use your actual data loading and preparation functions
+    # For demonstration, we'll assume you have these ready
+    
+    # 1. Initialize trainer with specific parameters
+    trainer = RGRModelTrainer(
+        min_support=0.02,
+        min_confidence=0.3,
+        learning_rate=0.1,
+        discount_factor=0.9,
+        exploration_rate=0.2,
+        q_learning_epochs=50,  # Reduced for demonstration
+        batch_size=16
+    )
+    
+    print("📊 Model initialized with training parameters:")
+    print(f"   - Q-Learning epochs: {trainer.q_learning_epochs}")
+    print(f"   - Learning rate: {trainer.learning_rate}")
+    print(f"   - Batch size: {trainer.batch_size}")
+    
+    # Here you would load and prepare your actual UCI data
+    file_path = r"C:\Users\rituparn\Downloads\Online Retail.xlsx"
+    df_clean = load_uci_dataset(file_path)
+    df_clean = clean_uci_dataset(df_clean)
+    transactions, user_item_matrix, item_stats, customer_stats = prepare_data_for_rgr(df_clean)
+    
+    # For now, we'll show the structure
+    print("\n📋 Training workflow:")
+    print("   1. Load UCI dataset")
+    print("   2. Clean and prepare data")
+    print("   3. Train association rules")
+    print("   4. Build user-item graph")
+    print("   5. Train Q-learning with multiple epochs")
+    print("   6. Save trained model")
+    print("   7. Test model on new users")
+    print("   8. Generate comprehensive plots")
+    
+    # Example of how to use:
+    example_code = '''
+    # Step 1-2: Data preparation (use your existing functions)
+    # df_clean = clean_uci_dataset(load_uci_dataset('Online Retail.xlsx'))
+    transactions, user_item_matrix, item_stats, customer_stats = prepare_data_for_rgr(df_clean)
+    
+    # Step 3-5: Training
+    trainer.association_rules_df = trainer.train_association_rules_detailed(transactions)
+    trainer.graph = build_user_item_graph(user_item_matrix)  # Use existing function
+    trainer.user_item_matrix = user_item_matrix
+    trainer.item_stats = item_stats
+    trainer.customer_stats = customer_stats
+    trainer.train_q_learning_explicit(user_item_matrix)
+    
+    # Step 6: Save model
+    trainer.save_model('rgr_trained_model.pkl')
+    
+    # Step 7: Load and test
+    loaded_trainer = RGRModelTrainer.load_model('rgr_trained_model.pkl')
+    test_users = [12346, 12347, 12348]  # Your test user IDs
+    results = loaded_trainer.test_recommendations(test_users, top_k=5)
+    
+    # Step 8: Visualize results
+    loaded_trainer.plot_advanced_results()
+    '''
+    # Step 3-5: Training
+    trainer.association_rules_df = trainer.train_association_rules_detailed(transactions)
+    trainer.graph = build_user_item_graph(user_item_matrix)  # Use existing function
+    trainer.user_item_matrix = user_item_matrix
+    trainer.item_stats = item_stats
+    trainer.customer_stats = customer_stats
+    trainer.train_q_learning_explicit(user_item_matrix)
+
+    # Step 6: Save model
+    trainer.save_model('rgr_trained_model.pkl')
+    
+    # Step 7: Load and test
+    loaded_trainer = RGRModelTrainer.load_model('rgr_trained_model.pkl')
+    test_users = [12346, 12347, 12348]  # Your test user IDs
+    results = loaded_trainer.test_recommendations(test_users, top_k=5)
+    
+    # Step 8: Visualize results
+    loaded_trainer.plot_advanced_results()
+
+    print(f"\n💻 Example implementation code:")
+    print(example_code)
+    
+    return trainer
+
+if __name__ == "__main__":
+    trainer = complete_training_and_testing_workflow()

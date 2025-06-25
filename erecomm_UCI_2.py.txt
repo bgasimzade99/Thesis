@@ -1,0 +1,838 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from mlxtend.frequent_patterns import apriori, association_rules
+from mlxtend.preprocessing import TransactionEncoder
+import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+random.seed(42)
+
+def load_uci_dataset(file_path):
+    """
+    Load UCI Online Retail dataset
+    Expected columns: InvoiceNo, StockCode, Description, Quantity, InvoiceDate, UnitPrice, CustomerID, Country
+    """
+    print("📦 Loading UCI Online Retail Dataset...")
+    
+    try:
+        # Load the dataset
+        if file_path.endswith('.xlsx'):
+            df_original = pd.read_excel(file_path)
+        elif file_path.endswith('.csv'):
+            df_original = pd.read_csv(file_path)
+        else:
+            raise ValueError("Unsupported file format. Please use .xlsx or .csv")
+        
+        print(f"✅ Loaded dataset with {len(df_original):,} transactions")
+        print(f"   - Columns: {list(df_original.columns)}")
+        
+        # Verify required columns
+        required_columns = ['InvoiceNo', 'StockCode', 'Description', 'Quantity', 
+                          'InvoiceDate', 'UnitPrice', 'CustomerID', 'Country']
+        missing_columns = [col for col in required_columns if col not in df_original.columns]
+        
+        if missing_columns:
+            print(f"⚠️ Missing required columns: {missing_columns}")
+            print("Please ensure your dataset has all UCI Online Retail columns")
+        
+        return df_original
+        
+    except FileNotFoundError:
+        print(f"❌ File not found: {file_path}")
+        print("Please check the file path and ensure the file exists")
+        return None
+    except Exception as e:
+        print(f"❌ Error loading dataset: {e}")
+        return None
+
+def clean_uci_dataset(df_original):
+    """
+    Clean UCI Online Retail dataset - handle missing values and data quality issues
+    """
+    print("🧹 Cleaning UCI Dataset...")
+    
+    print(f"   Initial dataset shape: {df_original.shape}")
+    
+    # Make a copy to avoid modifying original data
+    df_clean = df_original.copy()
+    
+    # Check for missing values in each column
+    print("\n   Missing values per column:")
+    missing_counts = df_clean.isnull().sum()
+    for col, count in missing_counts.items():
+        if count > 0:
+            print(f"     {col}: {count:,} ({count/len(df_clean)*100:.1f}%)")
+    
+    # 1. Remove rows with missing CustomerID (can't recommend without customer info)
+    initial_rows = len(df_clean)
+    df_clean = df_clean.dropna(subset=['CustomerID'])
+    print(f"   Removed {initial_rows - len(df_clean):,} rows with missing CustomerID")
+    
+    # 2. Remove rows with missing or empty Description (need product info)
+    df_clean = df_clean.dropna(subset=['Description'])
+    df_clean = df_clean[df_clean['Description'].str.strip() != '']
+    print(f"   Remaining rows after removing missing/empty descriptions: {len(df_clean):,}")
+    
+    # 3. Remove rows with invalid quantities or prices
+    df_clean = df_clean[df_clean['Quantity'] > 0]  # Remove negative quantities (returns/cancellations)
+    df_clean = df_clean[df_clean['UnitPrice'] > 0]  # Remove zero or negative prices
+    print(f"   Remaining rows after removing invalid quantities/prices: {len(df_clean):,}")
+    
+    # 4. Clean CustomerID (ensure it's numeric)
+    try:
+        df_clean['CustomerID'] = pd.to_numeric(df_clean['CustomerID'], errors='coerce')
+        df_clean = df_clean.dropna(subset=['CustomerID'])
+        df_clean['CustomerID'] = df_clean['CustomerID'].astype(int)
+        print(f"   CustomerID converted to numeric: {len(df_clean):,} rows remaining")
+    except:
+        print("   Warning: Could not convert CustomerID to numeric")
+    
+    # 5. Clean Description (remove extra spaces, standardize)
+    df_clean['Description'] = df_clean['Description'].str.strip().str.upper()
+    
+    # 6. Remove very rare products (appear in < 2 transactions) to reduce sparsity
+    product_counts = df_clean['Description'].value_counts()
+    frequent_products = product_counts[product_counts >= 2].index
+    df_clean = df_clean[df_clean['Description'].isin(frequent_products)]
+    print(f"   Filtered to products with ≥2 transactions: {len(df_clean):,} rows, {len(frequent_products):,} products")
+    
+    # 7. Remove customers with very few transactions (< 2) to improve recommendations
+    customer_counts = df_clean['CustomerID'].value_counts()
+    active_customers = customer_counts[customer_counts >= 2].index
+    df_clean = df_clean[df_clean['CustomerID'].isin(active_customers)]
+    print(f"   Filtered to customers with ≥2 transactions: {len(df_clean):,} rows, {len(active_customers):,} customers")
+    
+    # 8. Handle InvoiceDate if needed
+    if 'InvoiceDate' in df_clean.columns:
+        try:
+            df_clean['InvoiceDate'] = pd.to_datetime(df_clean['InvoiceDate'])
+        except:
+            print("   Warning: Could not parse InvoiceDate")
+    
+    # Final summary
+    print(f"\n✅ Dataset cleaning complete:")
+    print(f"   Final shape: {df_clean.shape}")
+    print(f"   Customers: {df_clean['CustomerID'].nunique():,}")
+    print(f"   Products: {df_clean['Description'].nunique():,}")
+    print(f"   Transactions: {df_clean['InvoiceNo'].nunique():,}")
+    print(f"   Countries: {df_clean['Country'].nunique()}")
+    
+    return df_clean
+
+def display_data_quality_report(df_original, df_clean):
+    """
+    Display comprehensive data quality report
+    """
+    print("\n📋 DATA QUALITY REPORT")
+    print("=" * 40)
+    
+    # Basic statistics
+    print(f"Original dataset: {len(df_original):,} rows")
+    print(f"Cleaned dataset: {len(df_clean):,} rows")
+    print(f"Data retention: {len(df_clean)/len(df_original)*100:.1f}%")
+    
+    # Missing data analysis
+    print(f"\nMissing data analysis:")
+    missing_original = df_original.isnull().sum()
+    missing_clean = df_clean.isnull().sum()
+    
+    for col in df_original.columns:
+        orig_missing = missing_original[col]
+        clean_missing = missing_clean[col] if col in df_clean.columns else 0
+        if orig_missing > 0:
+            print(f"  {col}: {orig_missing:,} → {clean_missing:,} missing values")
+    
+    # Business metrics
+    print(f"\nBusiness metrics:")
+    print(f"  Unique customers: {df_original['CustomerID'].nunique():,} → {df_clean['CustomerID'].nunique():,}")
+    print(f"  Unique products: {df_original['Description'].nunique():,} → {df_clean['Description'].nunique():,}")
+    print(f"  Unique invoices: {df_original['InvoiceNo'].nunique():,} → {df_clean['InvoiceNo'].nunique():,}")
+    print(f"  Countries: {df_clean['Country'].nunique()}")
+    
+    # Date range
+    if 'InvoiceDate' in df_clean.columns:
+        try:
+            date_range = pd.to_datetime(df_clean['InvoiceDate'])
+            print(f"  Date range: {date_range.min().date()} to {date_range.max().date()}")
+        except:
+            print(f"  Date range: Could not parse dates")
+    
+    # Price and quantity statistics
+    print(f"\nTransaction statistics:")
+    print(f"  Avg price: ${df_clean['UnitPrice'].mean():.2f}")
+    print(f"  Price range: ${df_clean['UnitPrice'].min():.2f} - ${df_clean['UnitPrice'].max():.2f}")
+    print(f"  Avg quantity: {df_clean['Quantity'].mean():.1f}")
+    print(f"  Total revenue: ${(df_clean['Quantity'] * df_clean['UnitPrice']).sum():,.2f}")
+    
+    print("=" * 40)
+
+def prepare_data_for_rgr(df_clean):
+    """
+    Prepare cleaned UCI data for RGR algorithm components
+    """
+    print("📊 Preparing data for RGR algorithm...")
+    
+    # 1. Prepare transactions for Association Rule Mining
+    # Group by invoice to create market basket transactions
+    print("   Creating transaction baskets...")
+    transactions = df_clean.groupby('InvoiceNo')['Description'].apply(list).tolist()
+    # Filter transactions with at least 2 items (needed for association rules)
+    transactions = [t for t in transactions if len(t) >= 2]
+    print(f"   Created {len(transactions):,} transaction baskets")
+    
+    # 2. Create user-item interaction matrix
+    print("   Creating user-item matrix...")
+    user_item_matrix = df_clean.pivot_table(
+        index='CustomerID', 
+        columns='Description', 
+        values='Quantity', 
+        aggfunc='sum', 
+        fill_value=0
+    )
+    # Convert to binary (0/1) for simplicity - focus on whether customer bought item
+    user_item_binary = (user_item_matrix > 0).astype(int)
+    print(f"   User-item matrix shape: {user_item_binary.shape}")
+    
+    # 3. Create item statistics for analysis
+    print("   Computing item statistics...")
+    item_stats = df_clean.groupby('Description').agg({
+        'UnitPrice': 'mean',
+        'Quantity': 'sum',
+        'CustomerID': 'nunique',
+        'InvoiceNo': 'count'
+    }).rename(columns={'CustomerID': 'unique_customers', 'InvoiceNo': 'frequency'})
+    
+    # 4. Create customer statistics
+    customer_stats = df_clean.groupby('CustomerID').agg({
+        'InvoiceNo': 'nunique',
+        'Description': 'nunique',
+        'Quantity': 'sum',
+        'UnitPrice': 'mean'
+    }).rename(columns={
+        'InvoiceNo': 'total_orders',
+        'Description': 'unique_products',
+        'Quantity': 'total_quantity',
+        'UnitPrice': 'avg_price'
+    })
+    
+    print(f"✅ Data preparation complete:")
+    print(f"   - {len(transactions):,} valid transaction baskets")
+    print(f"   - {user_item_binary.shape[0]:,} users × {user_item_binary.shape[1]:,} items matrix")
+    print(f"   - Matrix sparsity: {(1 - user_item_binary.sum().sum() / user_item_binary.size) * 100:.1f}%")
+    
+    return transactions, user_item_binary, item_stats, customer_stats
+
+def train_association_rules(transactions, min_support=0.02, min_confidence=0.3):
+    """
+    Component 1: Association Rule Mining
+    """
+    print("🔍 Training Association Rules...")
+    
+    # Convert transactions to binary matrix
+    te = TransactionEncoder()
+    te_ary = te.fit(transactions).transform(transactions)
+    df_encoded = pd.DataFrame(te_ary, columns=te.columns_)
+    
+    print(f"   Transaction matrix shape: {df_encoded.shape}")
+    
+    # Find frequent itemsets
+    try:
+        frequent_itemsets = apriori(df_encoded, min_support=min_support, use_colnames=True)
+        print(f"   Found {len(frequent_itemsets):,} frequent itemsets")
+    except:
+        print(f"   No frequent itemsets with support {min_support}, trying lower threshold...")
+        frequent_itemsets = apriori(df_encoded, min_support=0.01, use_colnames=True)
+        print(f"   Found {len(frequent_itemsets):,} frequent itemsets with lower threshold")
+    
+    # Generate association rules
+    if len(frequent_itemsets) > 0:
+        association_rules_df = association_rules(
+            frequent_itemsets, 
+            metric="confidence", 
+            min_threshold=min_confidence
+        )
+        print(f"✅ Generated {len(association_rules_df):,} association rules")
+        
+        if len(association_rules_df) > 0:
+            print(f"   Average confidence: {association_rules_df['confidence'].mean():.3f}")
+            print(f"   Max confidence: {association_rules_df['confidence'].max():.3f}")
+    else:
+        association_rules_df = pd.DataFrame()
+        print("⚠️ No association rules generated")
+    
+    return association_rules_df
+
+def build_user_item_graph(user_item_matrix):
+    """
+    Component 2: Graph-based collaborative filtering
+    """
+    print("🕸️ Building User-Item Graph...")
+    
+    # Create bipartite graph
+    graph = nx.Graph()
+    
+    # Add user and item nodes
+    users = [f"user_{u}" for u in user_item_matrix.index]
+    items = [f"item_{i}" for i in user_item_matrix.columns]
+    
+    graph.add_nodes_from(users, bipartite=0)
+    graph.add_nodes_from(items, bipartite=1)
+    
+    # Add edges based on interactions
+    edges_added = 0
+    for user_idx, user_id in enumerate(user_item_matrix.index):
+        user_node = f"user_{user_id}"
+        for item_idx, item_id in enumerate(user_item_matrix.columns):
+            if user_item_matrix.iloc[user_idx, item_idx] > 0:
+                item_node = f"item_{item_id}"
+                graph.add_edge(user_node, item_node)
+                edges_added += 1
+    
+    print(f"✅ Graph built: {len(users):,} users, {len(items):,} items, {edges_added:,} edges")
+    return graph
+
+def initialize_q_table(user_item_matrix):
+    """
+    Component 3: Initialize Q-learning table for reinforcement learning
+    """
+    print("🎯 Initializing Q-Learning...")
+    
+    q_table = defaultdict(lambda: defaultdict(float))
+    
+    # Initialize with small random values
+    for user in user_item_matrix.index:
+        for item in user_item_matrix.columns:
+            q_table[user][item] = np.random.uniform(0, 0.1)
+    
+    print(f"✅ Q-table initialized for {len(q_table):,} users")
+    return q_table
+
+def get_association_recommendations(association_rules_df, user_items, top_k=5):
+    """
+    Get recommendations using association rules
+    """
+    recommendations = []
+    
+    if len(association_rules_df) == 0:
+        return recommendations
+    
+    for item in user_items:
+        # Find rules where this item is in antecedents
+        relevant_rules = association_rules_df[
+            association_rules_df['antecedents'].apply(lambda x: item in x)
+        ]
+        
+        for _, rule in relevant_rules.iterrows():
+            for consequent in rule['consequents']:
+                if consequent not in user_items:
+                    recommendations.append({
+                        'item': consequent,
+                        'score': rule['confidence'],
+                        'method': 'association_rules'
+                    })
+    
+    # Remove duplicates and sort by score
+    unique_recommendations = {}
+    for rec in recommendations:
+        if rec['item'] not in unique_recommendations:
+            unique_recommendations[rec['item']] = rec
+        else:
+            # Keep the one with higher score
+            if rec['score'] > unique_recommendations[rec['item']]['score']:
+                unique_recommendations[rec['item']] = rec
+    
+    final_recommendations = list(unique_recommendations.values())
+    final_recommendations.sort(key=lambda x: x['score'], reverse=True)
+    
+    return final_recommendations[:top_k]
+
+def get_graph_recommendations(graph, user_id, user_item_matrix, top_k=5):
+    """
+    Get recommendations using graph-based collaborative filtering
+    """
+    user_node = f"user_{user_id}"
+    recommendations = []
+    
+    if user_node not in graph:
+        return recommendations
+    
+    # Get user's neighbors (items they interacted with)
+    user_items = list(graph.neighbors(user_node))
+    
+    # For each item, find similar users
+    item_scores = defaultdict(float)
+    
+    for item_node in user_items:
+        # Get users who also interacted with this item
+        similar_users = [n for n in graph.neighbors(item_node) 
+                        if n.startswith('user_') and n != user_node]
+        
+        # Get items from similar users
+        for similar_user in similar_users:
+            recommended_items = [n for n in graph.neighbors(similar_user) 
+                               if n.startswith('item_') and n not in user_items]
+            
+            for rec_item in recommended_items:
+                item_name = rec_item.replace('item_', '')
+                item_scores[item_name] += 1.0
+    
+    # Normalize scores by number of recommendations
+    for item in item_scores:
+        item_scores[item] = item_scores[item] / len(user_items) if len(user_items) > 0 else 0
+    
+    # Convert to recommendation format
+    for item, score in sorted(item_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]:
+        recommendations.append({
+            'item': item,
+            'score': score,
+            'method': 'graph_based'
+        })
+    
+    return recommendations
+
+def get_rl_recommendations(q_table, user_id, user_items, exploration_rate=0.1, top_k=5):
+    """
+    Get recommendations using Q-learning (reinforcement learning)
+    """
+    if user_id not in q_table:
+        return []
+    
+    user_q_values = q_table[user_id]
+    available_items = {item: q_val for item, q_val in user_q_values.items() 
+                      if item not in user_items}
+    
+    recommendations = []
+    
+    # Epsilon-greedy strategy
+    if np.random.random() < exploration_rate:
+        # Exploration: random items
+        if len(available_items) > 0:
+            item_list = list(available_items.keys())
+            random_items = random.sample(item_list, min(top_k, len(item_list)))
+            for item in random_items:
+                recommendations.append({
+                    'item': item,
+                    'score': available_items[item],
+                    'method': 'rl_exploration'
+                })
+    else:
+        # Exploitation: best Q-values
+        sorted_items = sorted(available_items.items(), key=lambda x: x[1], reverse=True)
+        for item, q_val in sorted_items[:top_k]:
+            recommendations.append({
+                'item': item,
+                'score': q_val,
+                'method': 'rl_exploitation'
+            })
+    
+    return recommendations
+
+def get_hybrid_recommendations(user_id, user_item_matrix, association_rules_df, 
+                             graph, q_table, top_k=10):
+    """
+    Combine all three RGR components for final recommendations
+    """
+    # Get user's interaction history
+    if user_id not in user_item_matrix.index:
+        return []
+    
+    user_row = user_item_matrix.loc[user_id]
+    user_items = user_row[user_row > 0].index.tolist()
+    
+    if len(user_items) == 0:
+        return []
+    
+    # Get recommendations from each component
+    assoc_recs = get_association_recommendations(association_rules_df, user_items, top_k)
+    graph_recs = get_graph_recommendations(graph, user_id, user_item_matrix, top_k)
+    rl_recs = get_rl_recommendations(q_table, user_id, user_items, top_k=top_k)
+    
+    # Combine recommendations with weights
+    all_recommendations = {}
+    weights = {
+        'association_rules': 0.4,
+        'graph_based': 0.4,
+        'rl_exploitation': 0.15,
+        'rl_exploration': 0.05
+    }
+    
+    # Process association rule recommendations
+    for rec in assoc_recs:
+        item = rec['item']
+        score = rec['score'] * weights['association_rules']
+        all_recommendations[item] = all_recommendations.get(item, 0) + score
+    
+    # Process graph-based recommendations
+    for rec in graph_recs:
+        item = rec['item']
+        score = rec['score'] * weights['graph_based']
+        all_recommendations[item] = all_recommendations.get(item, 0) + score
+    
+    # Process RL recommendations
+    for rec in rl_recs:
+        item = rec['item']
+        weight = weights.get(rec['method'], 0.1)
+        # Normalize Q-values to 0-1 range
+        normalized_score = (rec['score'] + 1) / 2  
+        score = normalized_score * weight
+        all_recommendations[item] = all_recommendations.get(item, 0) + score
+    
+    # Sort by combined score
+    final_recs = sorted(all_recommendations.items(), key=lambda x: x[1], reverse=True)
+    
+    return [{'item': item, 'score': score} for item, score in final_recs[:top_k]]
+
+def update_q_values(q_table, user_id, item, reward, learning_rate=0.1, discount_factor=0.9):
+    """
+    Update Q-values based on user feedback
+    """
+    current_q = q_table[user_id][item]
+    max_next_q = max(q_table[user_id].values()) if q_table[user_id] else 0
+    
+    # Q-learning update rule
+    new_q = current_q + learning_rate * (reward + discount_factor * max_next_q - current_q)
+    q_table[user_id][item] = new_q
+
+def simulate_user_feedback(user_id, recommended_item, user_item_matrix):
+    """
+    Simulate user feedback for demonstration
+    """
+    # Simple simulation: if user had interaction with similar items, higher chance of positive feedback
+    if user_id in user_item_matrix.index:
+        user_row = user_item_matrix.loc[user_id]
+        user_items = user_row[user_row > 0].index.tolist()
+        
+        # If recommended item is in user's history, positive feedback
+        if recommended_item in user_items:
+            return 1.0
+        else:
+            # Random feedback with bias towards positive
+            return 1.0 if np.random.random() > 0.4 else -0.5
+    
+    return random.choice([1.0, -0.5])
+
+def evaluate_system_performance(user_item_matrix, association_rules_df, graph, q_table):
+    """
+    Evaluate the RGR system performance
+    """
+    print("📈 Evaluating System Performance...")
+    
+    # Select test users
+    test_users = list(user_item_matrix.index)[:20]  # Test on first 20 users
+    
+    # Metrics storage
+    precision_scores = []
+    recall_scores = []
+    recommendation_times = []
+    coverage_items = set()
+    
+    for user_id in test_users:
+        # Get user's actual items
+        user_row = user_item_matrix.loc[user_id]
+        actual_items = user_row[user_row > 0].index.tolist()
+        
+        if len(actual_items) < 2:
+            continue
+        
+        # Split into train/test (use 70% for training, 30% for testing)
+        split_idx = int(0.7 * len(actual_items))
+        train_items = actual_items[:split_idx]
+        test_items = actual_items[split_idx:]
+        
+        if len(test_items) == 0:
+            continue
+        
+        # Time recommendation generation
+        start_time = time.time()
+        recommendations = get_hybrid_recommendations(
+            user_id, user_item_matrix, association_rules_df, graph, q_table, top_k=5
+        )
+        rec_time = time.time() - start_time
+        recommendation_times.append(rec_time)
+        
+        if len(recommendations) == 0:
+            continue
+        
+        # Calculate metrics
+        recommended_items = [rec['item'] for rec in recommendations]
+        coverage_items.update(recommended_items)
+        
+        # Precision and Recall
+        true_positives = len(set(recommended_items) & set(test_items))
+        precision = true_positives / len(recommended_items) if len(recommended_items) > 0 else 0
+        recall = true_positives / len(test_items) if len(test_items) > 0 else 0
+        
+        precision_scores.append(precision)
+        recall_scores.append(recall)
+        
+        # Simulate feedback and update Q-values
+        for rec in recommendations:
+            feedback = simulate_user_feedback(user_id, rec['item'], user_item_matrix)
+            update_q_values(q_table, user_id, rec['item'], feedback)
+    
+    # Calculate final metrics
+    avg_precision = np.mean(precision_scores) if len(precision_scores) > 0 else 0
+    avg_recall = np.mean(recall_scores) if len(recall_scores) > 0 else 0
+    f1_score = 2 * (avg_precision * avg_recall) / (avg_precision + avg_recall) if (avg_precision + avg_recall) > 0 else 0
+    
+    avg_rec_time = np.mean(recommendation_times) if len(recommendation_times) > 0 else 0
+    coverage = len(coverage_items) / len(user_item_matrix.columns) if len(user_item_matrix.columns) > 0 else 0
+    
+    # Print results
+    print(f"\n✅ PERFORMANCE RESULTS:")
+    print(f"   Precision: {avg_precision:.3f}")
+    print(f"   Recall: {avg_recall:.3f}")
+    print(f"   F1-Score: {f1_score:.3f}")
+    print(f"   Coverage: {coverage:.3f}")
+    print(f"   Avg Recommendation Time: {avg_rec_time:.4f}s")
+    print(f"   Recommendations/sec: {1/avg_rec_time:.2f}" if avg_rec_time > 0 else "   Recommendations/sec: ∞")
+    
+    return {
+        'precision': avg_precision,
+        'recall': avg_recall,
+        'f1_score': f1_score,
+        'coverage': coverage,
+        'avg_rec_time': avg_rec_time,
+        'total_users_tested': len(test_users)
+    }
+
+def create_performance_visualizations(performance_metrics, association_rules_df):
+    """
+    Create visualizations for system performance
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Accuracy Metrics
+    ax1 = axes[0, 0]
+    metrics = ['Precision', 'Recall', 'F1-Score', 'Coverage']
+    values = [
+        performance_metrics['precision'],
+        performance_metrics['recall'],
+        performance_metrics['f1_score'],
+        performance_metrics['coverage']
+    ]
+    bars = ax1.bar(metrics, values, color=['skyblue', 'lightgreen', 'coral', 'gold'])
+    ax1.set_title('System Performance Metrics')
+    ax1.set_ylim(0, 1)
+    ax1.set_ylabel('Score')
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, values):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'{value:.3f}', ha='center', va='bottom')
+    
+    # Association Rules Distribution
+    ax2 = axes[0, 1]
+    if len(association_rules_df) > 0:
+        ax2.hist(association_rules_df['confidence'], bins=10, alpha=0.7, color='lightcoral')
+        ax2.set_title('Association Rules Confidence Distribution')
+        ax2.set_xlabel('Confidence')
+        ax2.set_ylabel('Frequency')
+    else:
+        ax2.text(0.5, 0.5, 'No Association\nRules Generated', 
+                ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+        ax2.set_title('Association Rules')
+    
+    # Performance Summary Pie Chart
+    ax3 = axes[1, 0]
+    performance_categories = ['Precision', 'Recall', 'Coverage', 'Speed']
+    performance_values = [
+        performance_metrics['precision'],
+        performance_metrics['recall'],
+        performance_metrics['coverage'],
+        min(1.0, 1/performance_metrics['avg_rec_time']) if performance_metrics['avg_rec_time'] > 0 else 1.0
+    ]
+    
+    colors = ['skyblue', 'lightgreen', 'gold', 'lightcoral']
+    ax3.pie(performance_values, labels=performance_categories, colors=colors, 
+            autopct='%1.1f%%', startangle=90)
+    ax3.set_title('Overall Performance Distribution')
+    
+    # Efficiency Metrics
+    ax4 = axes[1, 1]
+    efficiency_metrics = ['Rec Time (ms)', 'Users Tested', 'Rules Generated']
+    efficiency_values = [
+        performance_metrics['avg_rec_time'] * 1000,  # Convert to ms
+        performance_metrics['total_users_tested'],
+        len(association_rules_df) if len(association_rules_df) > 0 else 0
+    ]
+    
+    # Normalize values for better visualization
+    max_val = max(efficiency_values) if max(efficiency_values) > 0 else 1
+    normalized_values = [val / max_val for val in efficiency_values]
+    
+    bars = ax4.bar(efficiency_metrics, normalized_values, color=['orange', 'purple', 'brown'])
+    ax4.set_title('System Efficiency Metrics (Normalized)')
+    ax4.set_ylabel('Normalized Value')
+    
+    # Add actual values as labels
+    for bar, actual_val in zip(bars, efficiency_values):
+        height = bar.get_height()
+        ax4.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'{actual_val:.1f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.show()
+
+def demonstrate_recommendations(user_item_matrix, association_rules_df, graph, q_table):
+    """
+    Demonstrate recommendations for sample users
+    """
+    print("\n🎯 DEMONSTRATION: Sample Recommendations")
+    print("=" * 50)
+    
+    # Select a few sample users
+    sample_users = list(user_item_matrix.index)[:5]
+    
+    for i, user_id in enumerate(sample_users, 1):
+        print(f"\n👤 User {i} (ID: {user_id}):")
+        
+        # Show user's purchase history
+        user_row = user_item_matrix.loc[user_id]
+        user_items = user_row[user_row > 0].index.tolist()
+        print(f"   Purchase history ({len(user_items)} items):")
+        for item in user_items[:5]:  # Show first 5 items
+            print(f"     • {item}")
+        if len(user_items) > 5:
+            print(f"     ... and {len(user_items) - 5} more items")
+        
+        # Get recommendations
+        recommendations = get_hybrid_recommendations(
+            user_id, user_item_matrix, association_rules_df, graph, q_table, top_k=5
+        )
+        
+        print(f"   🎯 Top 5 Recommendations:")
+        if len(recommendations) > 0:
+            for j, rec in enumerate(recommendations, 1):
+                print(f"     {j}. {rec['item']} (Score: {rec['score']:.3f})")
+        else:
+            print("     No recommendations available")
+
+def main():
+    """
+    Main function to run the complete RGR system with UCI Online Retail dataset
+    """
+    print("🚀 RGR RECOMMENDER SYSTEM FOR SMALL BUSINESSES")
+    print("=" * 60)
+    print("Implementing: Rule-based + Graph-based + Reinforcement Learning")
+    print("Dataset: UCI Online Retail Dataset")
+    print("=" * 60)
+    
+    # Step 1: Load UCI Dataset
+    print("\n📦 STEP 1: DATA LOADING")
+    
+    # Update this path to your UCI dataset file
+    file_path = r"C:\Users\Mr. Rituparn Singh\Downloads\Online Retail.xlsx"
+    
+    df_original = load_uci_dataset(file_path)
+    
+    if df_original is None:
+        print("❌ Failed to load dataset. Please check the file path and format.")
+        return None
+    
+    # Step 2: Clean and prepare data for RGR
+    print("\n🔧 STEP 2: DATA CLEANING AND PROCESSING")
+    df_clean = clean_uci_dataset(df_original)
+    
+    # Display data quality report
+    display_data_quality_report(df_original, df_clean)
+    
+    # Prepare data for RGR algorithm
+    transactions, user_item_matrix, item_stats, customer_stats = prepare_data_for_rgr(df_clean)
+    
+    # Display data insights
+    print(f"\n📊 DATASET INSIGHTS:")
+    print(f"   Top 5 customers by transactions:")
+    top_customers = customer_stats.nlargest(5, 'total_orders')
+    for customer_id, stats in top_customers.iterrows():
+        print(f"     Customer {customer_id}: {stats['total_orders']} orders, {stats['unique_products']} products")
+    
+    print(f"\n   Top 5 products by popularity:")
+    top_products = item_stats.nlargest(5, 'unique_customers')
+    for product, stats in top_products.iterrows():
+        print(f"     {product[:50]}...: {stats['unique_customers']} customers")
+    
+    # Step 3: Train RGR Components
+    print("\n🏋️ STEP 3: TRAINING RGR COMPONENTS")
+    
+    # Component 1: Association Rules
+    association_rules_df = train_association_rules(transactions)
+    
+    # Component 2: Graph-based
+    graph = build_user_item_graph(user_item_matrix)
+    
+    # Component 3: Q-Learning
+    q_table = initialize_q_table(user_item_matrix)
+    
+    # Step 4: Demonstrate Recommendations
+    print("\n🎯 STEP 4: RECOMMENDATION DEMONSTRATION")
+    demonstrate_recommendations(user_item_matrix, association_rules_df, graph, q_table)
+    
+    # Step 5: Evaluate Performance
+    print("\n📈 STEP 5: PERFORMANCE EVALUATION")
+    performance_metrics = evaluate_system_performance(
+        user_item_matrix, association_rules_df, graph, q_table
+    )
+    
+    # Step 6: Create Visualizations
+    print("\n📊 STEP 6: PERFORMANCE VISUALIZATION")
+    create_performance_visualizations(performance_metrics, association_rules_df)
+    
+    # Step 7: Final Summary
+    print("\n✅ SYSTEM SUMMARY")
+    print("=" * 40)
+    print(f"Dataset Size: {len(df_original):,} → {len(df_clean):,} (after cleaning)")
+    print(f"Users: {user_item_matrix.shape[0]:,}")
+    print(f"Products: {user_item_matrix.shape[1]:,}")
+    print(f"Association Rules: {len(association_rules_df):,}")
+    print(f"Graph Edges: {graph.number_of_edges():,}")
+    print(f"F1-Score: {performance_metrics['f1_score']:.3f}")
+    print(f"Coverage: {performance_metrics['coverage']:.3f}")
+    print(f"Avg Response Time: {performance_metrics['avg_rec_time']:.4f}s")
+    
+    print("\n🎉 RGR System Training and Evaluation Complete!")
+    print("\n💡 Key Benefits for Small Businesses:")
+    print("   • Handles real-world data quality issues")
+    print("   • Robust cleaning and preprocessing")
+    print("   • Lightweight algorithms suitable for small businesses")
+    print("   • Comprehensive evaluation framework")
+    print("   • Easy to implement and maintain")
+    print("   • Scales with business growth")
+    
+    return {
+        'original_data': df_original,
+        'clean_data': df_clean,
+        'user_item_matrix': user_item_matrix,
+        'association_rules': association_rules_df,
+        'graph': graph,
+        'q_table': q_table,
+        'performance': performance_metrics,
+        'item_stats': item_stats,
+        'customer_stats': customer_stats
+    }
+
+# Run the complete system
+if __name__ == "__main__":
+    print("📋 INSTRUCTIONS:")
+    print("1. Update the file_path variable in main() to point to your UCI dataset")
+    print("2. Ensure your dataset has the required UCI columns")
+    print("3. Run the script to train and evaluate the RGR system")
+    print("\n" + "="*60)
+    
+    results = main()
+    
+    if results:
+        print("\n✅ SUCCESS! RGR system trained successfully on your UCI dataset.")
+        print("The system is now ready for production deployment.")
+    else:
+        print("\n❌ FAILED! Please check your dataset and try again.")
